@@ -204,7 +204,7 @@ class CrossAttention(nn.Module):
         self.to_kv = nn.Linear(context_dim, dim_head * 2, bias=False)
         self.to_out = nn.Linear(inner_dim, dim, bias=False)
 
-        # whether to have parallel feedforward
+        # parallel feedforward
 
         ff_inner_dim = ff_mult * dim
 
