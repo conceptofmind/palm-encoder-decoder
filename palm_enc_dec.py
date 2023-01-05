@@ -157,12 +157,10 @@ class ParallelTransformerBlock(nn.Module):
 
         sim = einsum("b h i d, b j d -> b h i j", q, k)
 
-        # causal mask
+        # mask
 
         causal_mask = self.get_mask(n, device)
         sim = sim.masked_fill(causal_mask, -torch.finfo(sim.dtype).max)
-
-        # extra attention mask - for masking out attention from text CLS token to padding
 
         if exists(attn_mask):
             sim = sim.masked_fill(~attn_mask, -torch.finfo(sim.dtype).max)
@@ -191,9 +189,7 @@ class CrossAttention(nn.Module):
         context_dim=None,
         dim_head=64,
         heads=8,
-        parallel_ff=False,
         ff_mult=4,
-        norm_context=False
     ):
         super().__init__()
         self.heads = heads
@@ -202,7 +198,7 @@ class CrossAttention(nn.Module):
         context_dim = default(context_dim, dim)
 
         self.norm = LayerNorm(dim)
-        self.context_norm = LayerNorm(context_dim) if norm_context else nn.Identity()
+        self.context_norm = LayerNorm(context_dim)
 
         self.to_q = nn.Linear(dim, inner_dim, bias=False)
         self.to_kv = nn.Linear(context_dim, dim_head * 2, bias=False)
@@ -216,9 +212,19 @@ class CrossAttention(nn.Module):
             nn.Linear(dim, ff_inner_dim * 2, bias=False),
             SwiGLU(),
             nn.Linear(ff_inner_dim, dim, bias=False)
-        ) if parallel_ff else None
+        )
 
-    def forward(self, x, context):
+        self.register_buffer("mask", None, persistent=False)
+
+    def get_mask(self, n, device):
+        if self.mask is not None and self.mask.shape[-1] >= n:
+            return self.mask[:n, :n]
+
+        mask = torch.ones((n, n), device=device, dtype=torch.bool).triu(1)
+        self.register_buffer("mask", mask, persistent=False)
+        return mask
+
+    def forward(self, x, context, attn_mask=None):
         """
         einstein notation
         b - batch
@@ -226,6 +232,8 @@ class CrossAttention(nn.Module):
         n, i, j - sequence length (base sequence length, source, target)
         d - feature dimension
         """
+
+        n, device, h = x.shape[1], x.device, self.heads
 
         # pre-layernorm, for queries and context
 
@@ -249,6 +257,14 @@ class CrossAttention(nn.Module):
 
         sim = einsum('b h i d, b j d -> b h i j', q, k)
 
+        # mask
+
+        causal_mask = self.get_mask(n, device)
+        sim = sim.masked_fill(causal_mask, -torch.finfo(sim.dtype).max)
+
+        if exists(attn_mask):
+            sim = sim.masked_fill(~attn_mask, -torch.finfo(sim.dtype).max)
+
         # attention
 
         sim = sim - sim.amax(dim=-1, keepdim=True)
@@ -262,11 +278,7 @@ class CrossAttention(nn.Module):
 
         out = rearrange(out, 'b h n d -> b n (h d)')
         out = self.to_out(out)
-
-        # add parallel feedforward (for multimodal layers)
-
-        if exists(self.ff):
-            out = out + self.ff(x)
+        out = out + self.ff(x)
 
         return out
 
@@ -314,14 +326,14 @@ class Decoder(nn.Module):
         for _ in range(depth):
             self.layers.append(nn.ModuleList([
                 Residual(ParallelTransformerBlock(dim=dim, dim_head=dim_head, heads=heads, ff_mult=ff_mult)),
-                Residual(CrossAttention(dim=dim, dim_head=dim_head, heads=heads, parallel_ff=True, ff_mult=ff_mult))
+                Residual(CrossAttention(dim=dim, dim_head=dim_head, heads=heads, ff_mult=ff_mult))
             ]))
 
     def forward(self, x, context, attn_mask=None):
 
         for attn, cross_attn in self.layers:
             x = attn(x, attn_mask)
-            x = cross_attn(x, context)
+            x = cross_attn(x, context, attn_mask=attn_mask)
         return x
 
 # PaLM
